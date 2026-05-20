@@ -27,7 +27,7 @@ function parseSIE(content: string) {
     if (tag === '#TRANS' && currentVerDate) {
       const ym = currentVerDate.substring(0, 6)
       const acc = parseInt(parts[1] || '0')
-      const amt = parseFloat(parts[3] || '0')
+      const amt = parseFloat((parts[3] || '0').replace(',', '.')) || 0
       if (!monthly[ym]) monthly[ym] = { month: `${ym.substring(0,4)}-${ym.substring(4,6)}`, revenue:0, expenses:0, profit:0, personnel:0 }
       const m = monthly[ym]
       if (acc >= 3000 && acc < 4000) m.revenue += Math.abs(amt)
