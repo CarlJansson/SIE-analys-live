@@ -31,7 +31,7 @@ function clean(s: string) { return (s || '').replace(/^"|"$/g, '') }
 
 export function parseSIE(content: string): SIEData {
   const lines = content.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
-  
+
   let companyName = 'Ditt företag', start = '', end = ''
   const monthly: Record<string, MonthlyData> = {}
   const accounts: SIEData['accounts'] = {}
@@ -40,6 +40,7 @@ export function parseSIE(content: string): SIEData {
   const res: Record<string, number> = {}
   let verDate = ''
 
+  // ── Pass 1: läs alla metadata ──────────────────────────────────────────
   for (const line of lines) {
     const parts = tokenize(line)
     if (!parts.length) continue
@@ -56,6 +57,7 @@ export function parseSIE(content: string): SIEData {
     if (tag === '#UB' && parts[1] === '0' && parts[2]) {
       ub[parts[2]] = parseFloat((parts[3] || '0').replace(',', '.'))
     }
+    // #RES = periodsaldon — auktoritativ källa för helårssummor
     if (tag === '#RES' && parts[1] === '0' && parts[2]) {
       res[parts[2]] = parseFloat((parts[3] || '0').replace(',', '.'))
     }
@@ -67,8 +69,7 @@ export function parseSIE(content: string): SIEData {
     if (tag === '#TRANS' && verDate) {
       const ym = verDate.substring(0, 6)
       const acc = parseInt(parts[1] || '0')
-      
-      // Hitta belopp — hoppa över { }
+
       let amtRaw = 0
       for (let i = 2; i < parts.length; i++) {
         const v = parts[i]
@@ -88,24 +89,28 @@ export function parseSIE(content: string): SIEData {
       }
       const m = monthly[ym]
 
-      // KORREKT: intäkter är kredit (negativa i SIE) → negera för positivt värde
-      if (acc >= 3000 && acc < 3800) {
-        const rv = -amtRaw
-        if (rv > 0) m.revenue += rv
-      }
-      // Kostnader: exkludera 8999 (årets resultat — är en summering, inte kostnad)
+      // Kostnader per månad från #TRANS (debet = positiv)
+      // Exkludera 8999 (årets resultat — summering, inte kostnad)
       if (acc >= 4000 && acc < 8999) m.expenses += amtAbs
       if (acc >= 7000 && acc < 8000) m.personnel += amtAbs
       if (acc >= 4000 && acc < 5000) m.material += amtAbs
       if (acc >= 5000 && acc < 6000) m.external += amtAbs
       if (acc >= 6000 && acc < 7000) m.other += amtAbs
       if (acc >= 8000 && acc < 8999) m.financial += amtAbs
+
+      // Moms och kassa från #TRANS
       if (acc === 2610 || acc === 2611) m.vat_out += amtAbs
       if (acc === 2641) m.vat_in += amtAbs
-      // Kassaflöde — alla bankkonton 1910-1990
       if (acc >= 1910 && acc <= 1990) {
         if (amtRaw > 0) m.cash_in += amtRaw
         else m.cash_out += Math.abs(amtRaw)
+      }
+
+      // INTÄKTER per månad: kredit (negativ) = intäkt
+      // Använder NETTO per månad — inkluderar korrigeringar korrekt
+      if (acc >= 3000 && acc < 3800) {
+        // Nettobidrag: negativ = kredit = intäkt, positiv = debet = avdrag
+        m.revenue += -amtRaw
       }
 
       // Kontostatistik
@@ -114,48 +119,80 @@ export function parseSIE(content: string): SIEData {
     }
   }
 
+  // ── Beräkna månadsdata ────────────────────────────────────────────────
   const months = Object.values(monthly).sort((a, b) => a.month.localeCompare(b.month))
+
+  // Använd #RES som facit för helårsomsättning
+  // #RES: negativ = kreditkonto = intäkt (negera för positivt)
+  const resRevenue = Object.entries(res)
+    .filter(([k]) => { const n = parseInt(k); return n >= 3000 && n <= 3799 })
+    .reduce((sum, [, v]) => sum + (-v), 0)
+
+  const resCost = Object.entries(res)
+    .filter(([k]) => { const n = parseInt(k); return n >= 4000 && n <= 8998 })
+    .reduce((sum, [, v]) => sum + v, 0)
+
+  // Summera månadsdata från #TRANS
+  const transRevTotal = months.reduce((s, m) => s + m.revenue, 0)
+  const transCostTotal = months.reduce((s, m) => s + m.expenses, 0)
+
+  // Om #RES finns och avviker >1% från #TRANS: skala om månadsdata
+  // #RES är alltid mer korrekt (innehåller periodjusteringar)
+  if (resRevenue > 0 && Math.abs(resRevenue - transRevTotal) / resRevenue > 0.01) {
+    const scaleFactor = resRevenue / Math.max(transRevTotal, 1)
+    months.forEach(m => { m.revenue *= scaleFactor })
+  }
+
   months.forEach(m => { m.profit = m.revenue - m.expenses })
 
-  // Beräkna summary
-  const s = months.reduce((acc, m) => ({
-    totalRevenue: acc.totalRevenue + m.revenue,
-    totalExpenses: acc.totalExpenses + m.expenses,
-    personnel: acc.personnel + m.personnel,
-    material: acc.material + m.material,
-    external: acc.external + m.external,
-    other: acc.other + m.other,
-    financial: acc.financial + m.financial,
-    vat_out: acc.vat_out + m.vat_out,
-    vat_in: acc.vat_in + m.vat_in,
-    cash_in: acc.cash_in + m.cash_in,
-    cash_out: acc.cash_out + m.cash_out,
-  }), { totalRevenue:0, totalExpenses:0, personnel:0, material:0, external:0, other:0, financial:0, vat_out:0, vat_in:0, cash_in:0, cash_out:0 })
+  // Använd #RES-total som auktoritativ omsättning
+  const totalRevenue = resRevenue > 0 ? resRevenue : months.reduce((s, m) => s + m.revenue, 0)
+  const totalExpenses = resCost > 0 ? resCost : months.reduce((s, m) => s + m.expenses, 0)
 
-  const profit = s.totalRevenue - s.totalExpenses
+  const s = {
+    personnel: months.reduce((a, m) => a + m.personnel, 0),
+    material:  months.reduce((a, m) => a + m.material, 0),
+    external:  months.reduce((a, m) => a + m.external, 0),
+    other:     months.reduce((a, m) => a + m.other, 0),
+    financial: months.reduce((a, m) => a + m.financial, 0),
+    vat_out:   months.reduce((a, m) => a + m.vat_out, 0),
+    vat_in:    months.reduce((a, m) => a + m.vat_in, 0),
+    cash_in:   months.reduce((a, m) => a + m.cash_in, 0),
+    cash_out:  months.reduce((a, m) => a + m.cash_out, 0),
+  }
+
+  const profit = totalRevenue - totalExpenses
 
   // Kassa — alla bankkonton 1910-1990
-  const cashUB = Object.entries(ub).filter(([k]) => { const n = parseInt(k); return n >= 1910 && n <= 1990 }).reduce((a, [,v]) => a + (v > 0 ? v : 0), 0)
-  const cashIB = Object.entries(ib).filter(([k]) => { const n = parseInt(k); return n >= 1910 && n <= 1990 }).reduce((a, [,v]) => a + (v > 0 ? v : 0), 0)
+  const cashUB = Object.entries(ub)
+    .filter(([k]) => { const n = parseInt(k); return n >= 1910 && n <= 1990 })
+    .reduce((a, [, v]) => a + (v > 0 ? v : 0), 0)
+  const cashIB = Object.entries(ib)
+    .filter(([k]) => { const n = parseInt(k); return n >= 1910 && n <= 1990 })
+    .reduce((a, [, v]) => a + (v > 0 ? v : 0), 0)
 
   // Kundfordringar netto (efter nedskrivning 1519)
   const receivablesUB = (ub['1510'] || 0) + (ub['1519'] || 0)
 
-  // Omsättningstillgångar (1300-1999, exkl anläggningstillgångar)
-  const currentAssetsUB = Object.entries(ub).filter(([k, v]) => { const n = parseInt(k); return n >= 1300 && n <= 1999 && v > 0 }).reduce((a, [,v]) => a + v, 0)
+  // Omsättningstillgångar (1300-1999 positiva UB, exkl. anläggningstillgångar)
+  const currentAssetsUB = Object.entries(ub)
+    .filter(([k, v]) => { const n = parseInt(k); return n >= 1300 && n <= 1999 && v > 0 })
+    .reduce((a, [, v]) => a + v, 0)
 
-  // Kortfristiga skulder
-  const currentLiabUB = Object.entries(ub).filter(([k, v]) => k.startsWith('2') && v < 0).reduce((a, [,v]) => a + Math.abs(v), 0)
+  // Kortfristiga skulder (2xxx negativa UB)
+  const currentLiabUB = Object.entries(ub)
+    .filter(([k, v]) => k.startsWith('2') && v < 0)
+    .reduce((a, [, v]) => a + Math.abs(v), 0)
 
-  // Moms — 2650 primärt
+  // Moms — 2650 primärt, annars 2610/2611
   const vatOut = Math.abs(ub['2650'] || 0) + Math.abs(ub['2610'] || 0) + Math.abs(ub['2611'] || 0)
   const vatIn  = (ub['2641'] || 0) + (ub['2645'] || 0) + Math.abs(ub['2651'] || 0)
   const vatNet = vatOut - vatIn
 
   const summary: Summary = {
-    ...s, profit,
-    operatingMargin: s.totalRevenue > 0 ? (profit / s.totalRevenue) * 100 : 0,
-    personnelRatio:  s.totalRevenue > 0 ? (s.personnel / s.totalRevenue) * 100 : 0,
+    ...s, totalRevenue, totalExpenses, profit,
+    operatingMargin:  totalRevenue > 0 ? (profit / totalRevenue) * 100 : 0,
+    personnelRatio:   totalRevenue > 0 ? (s.personnel / totalRevenue) * 100 : 0,
     cashUB, cashIB, cashChange: cashUB - cashIB,
     receivablesUB, currentAssetsUB, currentLiabUB,
     liquidity: currentLiabUB > 0 ? currentAssetsUB / currentLiabUB : 0,
